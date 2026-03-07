@@ -74,6 +74,21 @@ export async function emergencyStop() {
     return update(ref(db, PATHS.control), { command: 'STOP' })
 }
 
+/** Set the soil moisture threshold for auto-pump (0–100 %) */
+export async function setMoistureThreshold(pct) {
+    return update(ref(db, PATHS.control), { moistureThreshold: Math.min(100, Math.max(0, Math.round(pct))) })
+}
+
+/** Set the arm servo angle (0 = lowered into soil, 90 = raised) */
+export async function setServoArm(angle) {
+    return update(ref(db, PATHS.control), { servoArm: Math.min(180, Math.max(0, Math.round(angle))) })
+}
+
+/** Set the camera servo angle (manual target; only applied while rover is stopped) */
+export async function setServoCam(angle) {
+    return update(ref(db, PATHS.control), { servoCam: Math.min(180, Math.max(0, Math.round(angle))) })
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  Realtime listeners (read from rover)
 // ═══════════════════════════════════════════════════════════════

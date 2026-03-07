@@ -4,36 +4,40 @@
  *   Hardware: ESP32 DevKit v1
  *
  *   Peripherals:
- *     • L298N Motor Driver  (2 DC motors)
- *     • 5V Relay            (Pump / Fertilizer sprayer)
- *     • Soil Moisture Sensor (Analog)
- *     • Neo-6M GPS Module   (UART2)
+ *     · L298N Motor Driver   (2 DC motors)
+ *     · 5V Relay             (Pump / Fertilizer sprayer)
+ *     · Soil Moisture Sensor (Analog)
+ *     · Neo-6M GPS Module    (UART2)
+ *     · Servo – Camera Pan   (slow 0->180->0 sweep when driving)
+ *     · Servo – Arm          (manual angle)
  *
  *   Communication: Firebase Realtime Database (via WiFi)
  *
  *   Libraries required (install via Arduino Library Manager):
- *     1. Firebase ESP32 Client  → https://github.com/mobizt/Firebase-ESP32
- *        (Install "Firebase Arduino Client Library for ESP8266 and ESP32")
- *     2. TinyGPSPlus            → https://github.com/mikalhart/TinyGPSPlus
+ *     1. Firebase ESP32 Client  (mobizt/Firebase-ESP32)
+ *     2. TinyGPSPlus            (mikalhart/TinyGPSPlus)
+ *     3. ESP32Servo             (madhephaestus/ESP32Servo)
  *
  *   Firebase Database Structure:
  *     /rover/
  *       control/
- *         command    → "FORWARD" | "BACKWARD" | "LEFT" | "RIGHT" | "STOP"
- *         speed      → 0-255 (PWM)
- *         pump       → true | false
- *         mode       → "AUTO" | "MANUAL"
- *         returnBase → true | false
+ *         command           -> "FORWARD"|"BACKWARD"|"LEFT"|"RIGHT"|"STOP"
+ *         speed             -> 0-255 (PWM)
+ *         pump              -> true | false  (manual mode only)
+ *         mode              -> "AUTO" | "MANUAL"
+ *         returnBase        -> true | false
+ *         servoCam          -> 0-180 (manual target; locked while moving)
+ *         servoArm          -> 0-180 (degrees)
+ *         moistureThreshold -> 0-100 (%) auto-pump triggers below this
  *       sensors/
- *         soilMoisture  → 0-100  (%)
- *         soilRaw       → 0-4095 (ADC raw)
- *         gpsLat        → float
- *         gpsLng        → float
- *         gpsSpeed      → float (km/h)
- *         gpsSats       → int
- *         gpsValid      → bool
- *         uptime        → int (seconds)
- *         rssi          → int (dBm)
+ *         soilMoisture      -> 0-100  (%)
+ *         soilRaw           -> 0-4095 (ADC raw)
+ *         gpsLat / gpsLng / gpsSpeed / gpsSats / gpsValid
+ *         uptime            -> int (seconds)
+ *         rssi              -> int (dBm)
+ *         autoPumpActive    -> bool
+ *         moistureThreshold -> int  (echoes current threshold)
+ *         camAngle          -> int  (current cam servo angle)
  * ═══════════════════════════════════════════════════════════════
  */
 
@@ -41,226 +45,257 @@
 #include <FirebaseESP32.h>
 #include <TinyGPSPlus.h>
 #include <HardwareSerial.h>
+#include <ESP32Servo.h>
 
 // ─── USER CONFIGURATION ────────────────────────────────────────
 #define WIFI_SSID       "YOUR_WIFI_SSID"
 #define WIFI_PASSWORD   "YOUR_WIFI_PASSWORD"
-
-// Firebase project settings
 #define FIREBASE_HOST   "YOUR_PROJECT_ID.firebaseio.com"
 #define FIREBASE_AUTH   "YOUR_DATABASE_SECRET_OR_TOKEN"
 // ───────────────────────────────────────────────────────────────
 
-// ─── PIN DEFINITIONS ───────────────────────────────────────────
-// L298N Motor Driver — Motor A (Left wheel)
+// ─── PIN DEFINITIONS ───────────────────────────────────────────// L298N Motor Driver — Motor A (Left wheel)
 #define MOTOR_A_IN1   12
 #define MOTOR_A_IN2   13
-#define MOTOR_A_EN    14    // PWM speed
 
 // L298N Motor Driver — Motor B (Right wheel)
 #define MOTOR_B_IN3   26
 #define MOTOR_B_IN4   27
-#define MOTOR_B_EN    25    // PWM speed
 
-// Pump Relay (active LOW relay — LOW = ON)
-#define RELAY_PUMP    32
+#define RELAY_PUMP    32    // Active-LOW relay
 
-// Soil Moisture Sensor (Analog)
-#define SOIL_SENSOR   34    // ADC1 channel (GPIO 34 is input-only, perfect for ADC)
+#define SERVO_CAM_PIN 18
+#define SERVO_ARM_PIN 19
 
-// GPS Neo-6M (hardware UART2)
-#define GPS_RX_PIN    16    // ESP32 RX2 ← GPS TX
-#define GPS_TX_PIN    17    // ESP32 TX2 → GPS RX (not used by GPS but required by HardwareSerial)
+#define SOIL_SENSOR   34    // ADC1 (input-only pin)
+
+#define GPS_RX_PIN    16
+#define GPS_TX_PIN    17
 #define GPS_BAUD      9600
 // ───────────────────────────────────────────────────────────────
 
-// ─── PWM CHANNELS (ESP32 LEDC) ─────────────────────────────────
-#define PWM_FREQ      1000   // 1 kHz
-#define PWM_RES       8      // 8-bit (0-255)
-#define PWM_CH_A      0
-#define PWM_CH_B      1
-// ───────────────────────────────────────────────────────────────
-
 // ─── TIMING ────────────────────────────────────────────────────
-#define SENSOR_INTERVAL_MS   1000   // Upload sensor data every 1s
-#define CMD_POLL_INTERVAL_MS  200   // Poll Firebase command every 200ms
+#define SENSOR_INTERVAL_MS    1000   // upload sensor data every 1 s
+#define CMD_POLL_INTERVAL_MS   200   // poll Firebase every 200 ms
+#define SERVO_STEP_MS           20   // move cam servo 1 deg every 20 ms (~3 s full sweep)
 // ───────────────────────────────────────────────────────────────
 
-// ─── SOIL SENSOR CALIBRATION ──────────────────────────────────
-// Measure these values with your specific sensor:
-#define SOIL_DRY_VAL    3200   // ADC reading in completely dry soil / air
-#define SOIL_WET_VAL     800   // ADC reading fully submerged in water
+// ─── SOIL CALIBRATION ──────────────────────────────────────────
+#define SOIL_DRY_VAL  3200   // ADC reading in dry air
+#define SOIL_WET_VAL   800   // ADC reading fully submerged
 // ───────────────────────────────────────────────────────────────
 
-// ─── GLOBAL OBJECTS ────────────────────────────────────────────
+// ─── GLOBALS ───────────────────────────────────────────────────
 FirebaseData   fbData;
 FirebaseAuth   fbAuth;
 FirebaseConfig fbConfig;
 
 TinyGPSPlus    gps;
-HardwareSerial gpsSerial(2);   // UART2
+HardwareSerial gpsSerial(2);
 
-// ─── STATE ─────────────────────────────────────────────────────
-String  currentCmd    = "STOP";
-int     motorSpeed    = 200;     // default PWM 0-255
-bool    pumpOn        = false;
-bool    autoMode      = true;
+Servo servoCam;
+Servo servoArm;
+
+// ── Control state ──────────────────────────────────────────────
+String  currentCmd        = "STOP";
+bool    pumpOn            = false;
+bool    autoMode          = true;
+int     servoCamTarget    = 90;   // firebase-commanded angle (used while stopped)
+int     servoArmAngle     = 90;
+int     moistureThreshold = 30;   // auto-pump below this %
+bool    autoPumpActive    = false;
+
+// ── Camera sweep state ─────────────────────────────────────────
+int           camAngle    = 90;   // current physical position
+int           camDir      = 1;    // 1=towards 180, -1=towards 0
+bool          wasSweeping = false;
+unsigned long lastServoStep = 0;
+
+// ── Timing ─────────────────────────────────────────────────────
 unsigned long lastSensorUpload = 0;
 unsigned long lastCmdPoll      = 0;
-unsigned long startTime        = millis();
+unsigned long startTime;
 
 // ═══════════════════════════════════════════════════════════════
-//  Motor Control Functions
+//  Helpers
 // ═══════════════════════════════════════════════════════════════
+bool isMoving() { return currentCmd != "STOP"; }
+
+// ── Motors — direction only (EN pins not wired) ────────────────
 void motorsStop() {
-  digitalWrite(MOTOR_A_IN1, LOW);
-  digitalWrite(MOTOR_A_IN2, LOW);
-  digitalWrite(MOTOR_B_IN3, LOW);
-  digitalWrite(MOTOR_B_IN4, LOW);
-  ledcWrite(PWM_CH_A, 0);
-  ledcWrite(PWM_CH_B, 0);
+  digitalWrite(MOTOR_A_IN1, LOW); digitalWrite(MOTOR_A_IN2, LOW);
+  digitalWrite(MOTOR_B_IN3, LOW); digitalWrite(MOTOR_B_IN4, LOW);
 }
-
-void motorsForward(int spd) {
-  digitalWrite(MOTOR_A_IN1, HIGH);
-  digitalWrite(MOTOR_A_IN2, LOW);
-  digitalWrite(MOTOR_B_IN3, HIGH);
-  digitalWrite(MOTOR_B_IN4, LOW);
-  ledcWrite(PWM_CH_A, spd);
-  ledcWrite(PWM_CH_B, spd);
+void motorsForward() {
+  digitalWrite(MOTOR_A_IN1, HIGH); digitalWrite(MOTOR_A_IN2, LOW);
+  digitalWrite(MOTOR_B_IN3, HIGH); digitalWrite(MOTOR_B_IN4, LOW);
 }
-
-void motorsBackward(int spd) {
-  digitalWrite(MOTOR_A_IN1, LOW);
-  digitalWrite(MOTOR_A_IN2, HIGH);
-  digitalWrite(MOTOR_B_IN3, LOW);
-  digitalWrite(MOTOR_B_IN4, HIGH);
-  ledcWrite(PWM_CH_A, spd);
-  ledcWrite(PWM_CH_B, spd);
+void motorsBackward() {
+  digitalWrite(MOTOR_A_IN1, LOW); digitalWrite(MOTOR_A_IN2, HIGH);
+  digitalWrite(MOTOR_B_IN3, LOW); digitalWrite(MOTOR_B_IN4, HIGH);
 }
-
-void motorsLeft(int spd) {
-  // Pivot left: left wheel backward, right wheel forward
-  digitalWrite(MOTOR_A_IN1, LOW);
-  digitalWrite(MOTOR_A_IN2, HIGH);
-  digitalWrite(MOTOR_B_IN3, HIGH);
-  digitalWrite(MOTOR_B_IN4, LOW);
-  ledcWrite(PWM_CH_A, spd);
-  ledcWrite(PWM_CH_B, spd);
+void motorsLeft() {
+  digitalWrite(MOTOR_A_IN1, LOW); digitalWrite(MOTOR_A_IN2, HIGH);
+  digitalWrite(MOTOR_B_IN3, HIGH); digitalWrite(MOTOR_B_IN4, LOW);
 }
-
-void motorsRight(int spd) {
-  // Pivot right: left wheel forward, right wheel backward
-  digitalWrite(MOTOR_A_IN1, HIGH);
-  digitalWrite(MOTOR_A_IN2, LOW);
-  digitalWrite(MOTOR_B_IN3, LOW);
-  digitalWrite(MOTOR_B_IN4, HIGH);
-  ledcWrite(PWM_CH_A, spd);
-  ledcWrite(PWM_CH_B, spd);
+void motorsRight() {
+  digitalWrite(MOTOR_A_IN1, HIGH); digitalWrite(MOTOR_A_IN2, LOW);
+  digitalWrite(MOTOR_B_IN3, LOW);  digitalWrite(MOTOR_B_IN4, HIGH);
 }
-
-void executeCommand(const String& cmd, int spd) {
-  if      (cmd == "FORWARD")  motorsForward(spd);
-  else if (cmd == "BACKWARD") motorsBackward(spd);
-  else if (cmd == "LEFT")     motorsLeft(spd);
-  else if (cmd == "RIGHT")    motorsRight(spd);
+void executeCommand(const String& cmd) {
+  if      (cmd == "FORWARD")  motorsForward();
+  else if (cmd == "BACKWARD") motorsBackward();
+  else if (cmd == "LEFT")     motorsLeft();
+  else if (cmd == "RIGHT")    motorsRight();
   else                        motorsStop();
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  Pump Control
-// ═══════════════════════════════════════════════════════════════
-void setPump(bool state) {
-  // Relay is active LOW: LOW = ON, HIGH = OFF
-  digitalWrite(RELAY_PUMP, state ? LOW : HIGH);
-  pumpOn = state;
+// ── Pump ───────────────────────────────────────────────────────
+void setPump(bool on) {
+  if (on == pumpOn) return;
+  digitalWrite(RELAY_PUMP, on ? LOW : HIGH);   // active-LOW
+  pumpOn = on;
+  Serial.printf("[PUMP] %s\n", on ? "ON" : "OFF");
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  Soil Moisture Reading
-// ═══════════════════════════════════════════════════════════════
-int readSoilMoisture() {
-  // Average 10 readings to reduce noise
-  long sum = 0;
-  for (int i = 0; i < 10; i++) {
-    sum += analogRead(SOIL_SENSOR);
-    delay(5);
-  }
-  return (int)(sum / 10);
+// ── Soil ───────────────────────────────────────────────────────
+int readSoilRaw() {
+  long s = 0;
+  for (int i = 0; i < 10; i++) { s += analogRead(SOIL_SENSOR); delay(5); }
+  return (int)(s / 10);
 }
-
 int soilRawToPercent(int raw) {
-  // Map raw ADC value to 0-100%
-  // Higher ADC = dryer soil (inverted)
-  int pct = map(raw, SOIL_DRY_VAL, SOIL_WET_VAL, 0, 100);
-  return constrain(pct, 0, 100);
+  return constrain(map(raw, SOIL_DRY_VAL, SOIL_WET_VAL, 0, 100), 0, 100);
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  Firebase — Poll commands
+//  Camera servo updater — called every loop iteration
+//  While moving : slow 0->180->0 sweep (1 deg / SERVO_STEP_MS)
+//  While stopped: smoothly returns to Firebase-commanded target
+// ═══════════════════════════════════════════════════════════════
+void updateCamServo() {
+  unsigned long now = millis();
+  if (now - lastServoStep < SERVO_STEP_MS) return;
+  lastServoStep = now;
+
+  if (isMoving()) {
+    // Sweep mode
+    wasSweeping = true;
+    camAngle += camDir;
+    if (camAngle >= 180) { camAngle = 180; camDir = -1; }
+    if (camAngle <= 0)   { camAngle = 0;   camDir =  1; }
+    servoCam.write(camAngle);
+  } else {
+    // Return-to-target mode
+    if (wasSweeping) {
+      // Just stopped — pick shortest direction back to target
+      wasSweeping = false;
+    }
+    if (camAngle < servoCamTarget) { camAngle++; servoCam.write(camAngle); }
+    else if (camAngle > servoCamTarget) { camAngle--; servoCam.write(camAngle); }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Firebase — poll commands
 // ═══════════════════════════════════════════════════════════════
 void pollFirebaseCommands() {
-  // Read command
+  // Command
   if (Firebase.getString(fbData, "/rover/control/command")) {
     String cmd = fbData.stringData();
     cmd.toUpperCase();
     if (cmd != currentCmd) {
       currentCmd = cmd;
-      Serial.printf("[CMD] → %s\n", currentCmd.c_str());
+      Serial.printf("[CMD] -> %s\n", currentCmd.c_str());
     }
   }
 
-  // Read speed
+  // Speed (stored in Firebase for future use; not applied without EN pins)
   if (Firebase.getInt(fbData, "/rover/control/speed")) {
-    motorSpeed = constrain(fbData.intData(), 0, 255);
+    // Speed value acknowledged but EN pins not wired — ignored
   }
 
-  // Read pump
-  if (Firebase.getBool(fbData, "/rover/control/pump")) {
-    bool newPump = fbData.boolData();
-    if (newPump != pumpOn) {
-      setPump(newPump);
-      Serial.printf("[PUMP] → %s\n", newPump ? "ON" : "OFF");
-    }
-  }
-
-  // Read mode
-  if (Firebase.getString(fbData, "/rover/control/mode")) {
+  // Mode
+  if (Firebase.getString(fbData, "/rover/control/mode"))
     autoMode = (fbData.stringData() == "AUTO");
-  }
 
-  // Return to base — override command
-  if (Firebase.getBool(fbData, "/rover/control/returnBase")) {
-    if (fbData.boolData()) {
-      currentCmd = "STOP";  // Placeholder: integrate with GPS navigation logic here
-      Serial.println("[RTB] Return to Base triggered");
+  // Moisture threshold
+  if (Firebase.getInt(fbData, "/rover/control/moistureThreshold")) {
+    int t = constrain(fbData.intData(), 0, 100);
+    if (t != moistureThreshold) {
+      moistureThreshold = t;
+      Serial.printf("[THRESHOLD] -> %d%%\n", moistureThreshold);
     }
   }
 
-  // Execute current command
-  executeCommand(currentCmd, motorSpeed);
+  // Manual pump (only in MANUAL mode)
+  if (!autoMode && Firebase.getBool(fbData, "/rover/control/pump")) {
+    setPump(fbData.boolData());
+  }
+
+  // Return to base
+  if (Firebase.getBool(fbData, "/rover/control/returnBase") && fbData.boolData()) {
+    currentCmd = "STOP";
+    Serial.println("[RTB] Return to Base triggered");
+  }
+
+  // Camera servo target (only honoured while stopped)
+  if (!isMoving() && Firebase.getInt(fbData, "/rover/control/servoCam")) {
+    int t = constrain(fbData.intData(), 0, 180);
+    if (t != servoCamTarget) {
+      servoCamTarget = t;
+      Serial.printf("[CAM TARGET] -> %d deg\n", servoCamTarget);
+    }
+  }
+
+  // Arm servo
+  if (Firebase.getInt(fbData, "/rover/control/servoArm")) {
+    int a = constrain(fbData.intData(), 0, 180);
+    if (a != servoArmAngle) {
+      servoArmAngle = a;
+      servoArm.write(servoArmAngle);
+      Serial.printf("[SERVO ARM] -> %d deg\n", servoArmAngle);
+    }
+  }
+
+  // Apply drive command
+  executeCommand(currentCmd);
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  Firebase — Upload sensor data
+//  Firebase — upload sensor data + auto-pump logic
 // ═══════════════════════════════════════════════════════════════
 void uploadSensorData() {
-  int   soilRaw = readSoilMoisture();
-  int   soilPct = soilRawToPercent(soilRaw);
-  int   rssi    = WiFi.RSSI();
-  int   uptime  = (millis() - startTime) / 1000;
+  int soilRaw = readSoilRaw();
+  int soilPct = soilRawToPercent(soilRaw);
+  int rssi    = WiFi.RSSI();
+  int uptime  = (millis() - startTime) / 1000;
 
-  // Build JSON payload for atomic update
+  // Auto-pump logic (AUTO mode only)
+  if (autoMode) {
+    if (soilPct < moistureThreshold && !pumpOn) {
+      setPump(true);
+      autoPumpActive = true;
+      Serial.printf("[AUTO-PUMP] ON  — %d%% < threshold %d%%\n", soilPct, moistureThreshold);
+    } else if (soilPct >= moistureThreshold && pumpOn && autoPumpActive) {
+      setPump(false);
+      autoPumpActive = false;
+      Serial.printf("[AUTO-PUMP] OFF — %d%% >= threshold %d%%\n", soilPct, moistureThreshold);
+    }
+  }
+
+  // Build JSON
   FirebaseJson json;
-  json.set("soilMoisture", soilPct);
-  json.set("soilRaw",      soilRaw);
-  json.set("uptime",       uptime);
-  json.set("rssi",         rssi);
-  json.set("pumpOn",       pumpOn);
-  json.set("command",      currentCmd);
-  json.set("speed",        motorSpeed);
+  json.set("soilMoisture",      soilPct);
+  json.set("soilRaw",           soilRaw);
+  json.set("uptime",            uptime);
+  json.set("rssi",              rssi);
+  json.set("pumpOn",            pumpOn);
+  json.set("command",           currentCmd);
+  json.set("autoPumpActive",    autoPumpActive);
+  json.set("moistureThreshold", moistureThreshold);
+  json.set("camAngle",          camAngle);
 
-  // GPS data (only update if fix is valid)
   if (gps.location.isValid() && gps.location.age() < 2000) {
     json.set("gpsLat",   gps.location.lat());
     json.set("gpsLng",   gps.location.lng());
@@ -274,10 +309,8 @@ void uploadSensorData() {
 
   Firebase.updateNode(fbData, "/rover/sensors", json);
 
-  Serial.printf("[SOIL] Raw:%d  Moisture:%d%%  [GPS] Valid:%s  [RSSI] %ddBm\n",
-    soilRaw, soilPct,
-    gps.location.isValid() ? "YES" : "NO",
-    rssi);
+  Serial.printf("[SOIL] %d%%(%d)  [THRESH] %d%%  [AUTO-PUMP] %s  [CAM] %ddeg  [RSSI] %ddBm\n",
+    soilPct, soilRaw, moistureThreshold, autoPumpActive ? "ON" : "OFF", camAngle, rssi);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -285,58 +318,60 @@ void uploadSensorData() {
 // ═══════════════════════════════════════════════════════════════
 void setup() {
   Serial.begin(115200);
-  Serial.println("\n\n=== AGRO-ROVER MAIN CONTROLLER BOOT ===");
+  Serial.println("\n\n=== AGRO-ROVER BOOT ===");
 
-  // ── Motor pins ──
-  pinMode(MOTOR_A_IN1, OUTPUT);
-  pinMode(MOTOR_A_IN2, OUTPUT);
-  pinMode(MOTOR_B_IN3, OUTPUT);
-  pinMode(MOTOR_B_IN4, OUTPUT);
-
-  // LEDC PWM for ENA/ENB
-  ledcSetup(PWM_CH_A, PWM_FREQ, PWM_RES);
-  ledcAttachPin(MOTOR_A_EN, PWM_CH_A);
-  ledcSetup(PWM_CH_B, PWM_FREQ, PWM_RES);
-  ledcAttachPin(MOTOR_B_EN, PWM_CH_B);
+  // Motors — direction pins only
+  pinMode(MOTOR_A_IN1, OUTPUT); pinMode(MOTOR_A_IN2, OUTPUT);
+  pinMode(MOTOR_B_IN3, OUTPUT); pinMode(MOTOR_B_IN4, OUTPUT);
+  // EN pins not wired — no ledcAttach needed
   motorsStop();
-  Serial.println("[OK] Motors initialized");
+  Serial.println("[OK] Motors (direction-only, EN pins not wired)");
 
-  // ── Relay pin ──
+  // Pump relay
   pinMode(RELAY_PUMP, OUTPUT);
-  digitalWrite(RELAY_PUMP, HIGH);   // OFF by default (active LOW)
-  Serial.println("[OK] Pump relay initialized (OFF)");
+  digitalWrite(RELAY_PUMP, HIGH);   // OFF (active-LOW)
+  Serial.println("[OK] Pump relay");
 
-  // ── Soil sensor ──
-  analogReadResolution(12);          // 12-bit ADC (0-4095)
-  analogSetAttenuation(ADC_11db);    // Full range 0-3.3V
-  Serial.println("[OK] Soil moisture sensor initialized");
+  // Soil sensor
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
+  Serial.println("[OK] Soil sensor");
 
-  // ── GPS (UART2) ──
+  // GPS
   gpsSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
-  Serial.println("[OK] GPS serial initialized");
+  Serial.println("[OK] GPS");
 
-  // ── WiFi ──
+  // Servos
+  ESP32PWM::allocateTimer(0); ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2); ESP32PWM::allocateTimer(3);
+  servoCam.setPeriodHertz(50); servoCam.attach(SERVO_CAM_PIN, 500, 2500);
+  servoArm.setPeriodHertz(50); servoArm.attach(SERVO_ARM_PIN, 500, 2500);
+  servoCam.write(servoCamTarget);
+  servoArm.write(servoArmAngle);
+  camAngle = servoCamTarget;
+  Serial.println("[OK] Servos");
+
+  // WiFi
   Serial.printf("[WiFi] Connecting to %s", WIFI_SSID);
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.printf("\n[WiFi] Connected! IP: %s\n", WiFi.localIP().toString().c_str());
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  Serial.printf("\n[WiFi] Connected — IP: %s\n", WiFi.localIP().toString().c_str());
 
-  // ── Firebase ──
-  fbConfig.host             = FIREBASE_HOST;
+  // Firebase
+  fbConfig.host = FIREBASE_HOST;
   fbConfig.signer.tokens.legacy_token = FIREBASE_AUTH;
   Firebase.begin(&fbConfig, &fbAuth);
   Firebase.reconnectWiFi(true);
   fbData.setResponseSize(4096);
-  Serial.println("[OK] Firebase connected");
+  Serial.println("[OK] Firebase");
 
-  // ── Write initial heartbeat ──
+  // Write initial state
   Firebase.setString(fbData, "/rover/status/state", "ONLINE");
-  Firebase.setString(fbData, "/rover/status/ip",    WiFi.localIP().toString().c_str());
+  Firebase.setString(fbData, "/rover/status/ip", WiFi.localIP().toString().c_str());
+  Firebase.setInt(fbData, "/rover/control/moistureThreshold", moistureThreshold);
 
-  Serial.println("=== BOOT COMPLETE — ROVER READY ===\n");
+  startTime = millis();
+  Serial.println("=== BOOT COMPLETE — READY ===\n");
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -345,28 +380,26 @@ void setup() {
 void loop() {
   unsigned long now = millis();
 
-  // ── Feed GPS parser ──
-  while (gpsSerial.available()) {
-    gps.encode(gpsSerial.read());
-  }
+  // Feed GPS
+  while (gpsSerial.available()) gps.encode(gpsSerial.read());
 
-  // ── Poll Firebase commands (fast cycle) ──
+  // Update camera servo (sweep or smooth return)
+  updateCamServo();
+
+  // Poll Firebase commands (200 ms)
   if (now - lastCmdPoll >= CMD_POLL_INTERVAL_MS) {
     lastCmdPoll = now;
     if (WiFi.status() == WL_CONNECTED) {
       pollFirebaseCommands();
     } else {
-      // WiFi dropped — safe stop
       motorsStop();
       WiFi.reconnect();
     }
   }
 
-  // ── Upload sensor data (slow cycle) ──
+  // Upload sensor data (1 s)
   if (now - lastSensorUpload >= SENSOR_INTERVAL_MS) {
     lastSensorUpload = now;
-    if (WiFi.status() == WL_CONNECTED) {
-      uploadSensorData();
-    }
+    if (WiFi.status() == WL_CONNECTED) uploadSensorData();
   }
 }

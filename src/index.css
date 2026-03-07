@@ -17,10 +17,14 @@ body {
   background: #080e1a;
   color: #e2e8f0;
   line-height: 1.5;
+  overflow: hidden;
+  height: 100vh;
+  width: 100vw;
 }
 
 #root {
-  min-height: 100vh;
+  height: 100%;
+  width: 100%;
 }
 
 button {

@@ -1,66 +1,97 @@
 import { useEffect, useRef, useState } from 'react'
 
-/* ── Gemini API integration ── */
-const GEMINI_API_KEY = import.meta.env.VITE_GEMINI_API_KEY || ''
-const GEMINI_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`
+/* ── Open-Source AI via Groq (free, CORS-friendly, open-source models) ── */
+const GROQ_API_KEY = import.meta.env.VITE_GROQ_API_KEY || ''
+const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions'
+
+// Open-source models hosted on Groq:
+const TEXT_MODEL = 'llama-3.3-70b-versatile'      // Meta Llama 3.3 – Apache 2.0
+const VISION_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct' // Llama 4 Vision – supports images
+
+const SYSTEM_PROMPT = `You are AgriAI, an expert agricultural AI assistant integrated into an autonomous crop-monitoring rover dashboard.
+You help farmers and agronomists with crop diseases, plant health, soil conditions, pest management, and best farming practices.
+Be concise, practical, and use emojis for readability. Format responses with clear sections using **bold** headers.`
+
+const VISION_SYSTEM = `You are AgriAI, an expert agricultural AI assistant. When given a crop or leaf image, analyze it and provide:
+1. **Disease Detection** 🔬: Identify any visible diseases, infections, or abnormalities
+2. **Health Status** 💚: Overall health assessment (Excellent/Good/Fair/Poor/Critical) with a score out of 100
+3. **Symptoms** 🌡️: List visible symptoms if any
+4. **Recommendations** 💊: Specific actionable advice for the farmer
+5. **Urgency Level** ⚠️: Low / Medium / High / Critical
+
+Keep the response concise, well-formatted with emojis for readability. After the analysis, invite the user to ask follow-up questions.`
 
 /* ── helpers ── */
 function fileToBase64(file) {
     return new Promise((resolve, reject) => {
         const reader = new FileReader()
-        reader.onload = () => resolve(reader.result.split(',')[1])
+        reader.onload = () => resolve(reader.result) // keep full data-URL for vision
         reader.onerror = reject
         reader.readAsDataURL(file)
     })
 }
 
-async function callGemini(messages, imageBase64 = null, imageMime = null) {
-    const parts = []
+async function callGroq(messages, imageDataUrl = null, imageMime = null) {
+    if (!GROQ_API_KEY) throw new Error('No API key set. Add VITE_GROQ_API_KEY to your .env file.')
 
-    if (imageBase64 && imageMime) {
-        parts.push({
-            inline_data: { mime_type: imageMime, data: imageBase64 },
-        })
-        parts.push({
-            text: `You are an expert agricultural AI assistant integrated into an autonomous crop-monitoring rover dashboard.
-Analyze this crop/leaf image and provide:
-1. **Disease Detection**: Identify any visible diseases, infections, or abnormalities
-2. **Health Status**: Overall health assessment (Excellent/Good/Fair/Poor/Critical) with a score out of 100
-3. **Symptoms**: List visible symptoms if any
-4. **Recommendations**: Specific actionable advice for the farmer
-5. **Urgency Level**: Low/Medium/High/Critical
+    let chatMessages
 
-Keep the response concise, well-formatted with clear sections and emojis for readability. 
-After the analysis, invite the user to ask follow-up questions about the crop.`,
-        })
-    } else {
+    if (imageDataUrl && imageMime) {
+        /* ── Vision path: Llama 4 Scout ── */
         const lastMsg = messages[messages.length - 1]
-        parts.push({
-            text: `You are an expert agricultural AI assistant integrated into an autonomous crop-monitoring rover dashboard.
-You help farmers and agronomists with crop diseases, plant health, soil conditions, pest management, and best farming practices.
-Be concise, practical, and use emojis for readability. 
-Current question: ${lastMsg?.content || ''}`,
-        })
+        const userText = lastMsg?.content || 'Please analyze this crop image.'
+        const langName = lang === 'hi' ? 'Hindi' : lang === 'te' ? 'Telugu' : 'English'
+        const visionPromptWithLang = `${VISION_SYSTEM}\n\nCRITICAL RULE: You MUST respond entirely in the ${langName} language.`
+        chatMessages = [
+            { role: 'system', content: visionPromptWithLang },
+            {
+                role: 'user',
+                content: [
+                    {
+                        type: 'image_url',
+                        image_url: { url: imageDataUrl },   // full data-URL
+                    },
+                    { type: 'text', text: userText },
+                ],
+            },
+        ]
+    } else {
+        /* ── Text path: Llama 3.3 ── */
+        const lastMsg = messages[messages.length - 1]
+        const langName = lang === 'hi' ? 'Hindi' : lang === 'te' ? 'Telugu' : 'English'
+        const promptWithLang = `${SYSTEM_PROMPT}\n\nCRITICAL RULE: You MUST respond entirely in the ${langName} language.`
+        chatMessages = [
+            { role: 'system', content: promptWithLang },
+            { role: 'user', content: lastMsg?.content || '' },
+        ]
     }
 
-    const body = {
-        contents: [{ parts }],
-        generationConfig: { temperature: 0.4, maxOutputTokens: 1024 },
-    }
+    const model = (imageDataUrl && imageMime) ? VISION_MODEL : TEXT_MODEL
 
-    const res = await fetch(GEMINI_URL, {
+    const res = await fetch(GROQ_URL, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
+        headers: {
+            'Authorization': `Bearer ${GROQ_API_KEY}`,
+            'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+            model,
+            messages: chatMessages,
+            temperature: 0.4,
+            max_tokens: 1024,
+        }),
     })
 
     if (!res.ok) {
         const err = await res.json().catch(() => ({}))
-        throw new Error(err?.error?.message || `API error ${res.status}`)
+        const msg = err?.error?.message || `API error ${res.status}`
+        if (res.status === 401) throw new Error('Invalid API key — check your VITE_GROQ_API_KEY in .env')
+        if (res.status === 429) throw new Error('Rate limit reached — please wait a moment and try again.')
+        throw new Error(msg)
     }
 
     const data = await res.json()
-    return data?.candidates?.[0]?.content?.parts?.[0]?.text || 'No response received.'
+    return data?.choices?.[0]?.message?.content?.trim() || 'No response received.'
 }
 
 /* ── message bubble ── */
@@ -103,12 +134,11 @@ const QUICK_SUGGESTIONS = [
 ]
 
 /* ════════ Main CropChatbot component ════════ */
-export default function CropChatbot({ open, onClose }) {
+export default function CropChatbot({ open, onClose, lang = 'en', t }) {
     const [messages, setMessages] = useState([
         {
             role: 'ai',
-            content:
-                '🌱 **AgriAI Assistant Online**\n\nUpload a photo of your crop or leaf for instant disease detection and health analysis, or ask me anything about crop management!\n\n📸 **Tip:** Clear, close-up photos give the best analysis results.',
+            content: t ? t.botWelcome : '🌱 **AgriAI Assistant Online**\n\nUpload a photo of your crop or leaf for instant disease detection and health analysis, or ask me anything about crop management!',
             time: new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
         },
     ])
@@ -132,10 +162,10 @@ export default function CropChatbot({ open, onClose }) {
     /* handle file selection */
     async function handleFile(file) {
         if (!file || !file.type.startsWith('image/')) return
-        const url = URL.createObjectURL(file)
-        const b64 = await fileToBase64(file)
-        setPendingImage({ base64: b64, mime: file.type, url })
-        setPreviewImg(url)
+        const previewUrl = URL.createObjectURL(file)
+        const dataUrl = await fileToBase64(file)   // full data-URL for Groq vision API
+        setPendingImage({ dataUrl, mime: file.type, url: previewUrl })
+        setPreviewImg(previewUrl)
     }
 
     /* send message / analyze image */
@@ -148,7 +178,7 @@ export default function CropChatbot({ open, onClose }) {
         // build user message
         const userMsg = {
             role: 'user',
-            content: text || '📸 Please analyze this crop image.',
+            content: text || (lang === 'hi' ? '📸 कृपया इस फसल की छवि का विश्लेषण करें।' : lang === 'te' ? '📸 దయచేసి ఈ పంట చిత్రాన్ని విశ్లేషించండి.' : '📸 Please analyze this crop image.'),
             image: pendingImage?.url || null,
             time: now,
         }
@@ -162,7 +192,7 @@ export default function CropChatbot({ open, onClose }) {
         setLoading(true)
 
         try {
-            const reply = await callGemini(newMessages, img?.base64, img?.mime)
+            const reply = await callGroq(newMessages, img?.dataUrl, img?.mime)
             setMessages((prev) => [
                 ...prev,
                 {
@@ -186,6 +216,7 @@ export default function CropChatbot({ open, onClose }) {
     }
 
     function handleKeyDown(e) {
+        e.stopPropagation() // Bulletproof fix: stop spacebars/arrows from reaching the global window listeners
         if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault()
             sendMessage()
@@ -220,8 +251,8 @@ export default function CropChatbot({ open, onClose }) {
                     <div className="chatbot-brand">
                         <span className="chatbot-icon">🌿</span>
                         <div>
-                            <h3>AgriAI Assistant</h3>
-                            <span className="chatbot-subtitle">Crop Disease &amp; Health Analyzer</span>
+                            <h3>{t ? t.botTitle : 'AgriAI Assistant'}</h3>
+                            <span className="chatbot-subtitle">{t ? t.botSubtitle : 'Crop Disease & Health Analyzer'}</span>
                         </div>
                     </div>
                     <div className="chatbot-header-actions">
@@ -249,7 +280,7 @@ export default function CropChatbot({ open, onClose }) {
                 >
                     {dragOver && (
                         <div className="drop-overlay">
-                            <span>📸 Drop image here to analyze</span>
+                            <span>{t ? t.botDrop : '📸 Drop image here to analyze'}</span>
                         </div>
                     )}
                     {messages.map((msg, i) => (
@@ -283,7 +314,7 @@ export default function CropChatbot({ open, onClose }) {
                 {previewImg && (
                     <div className="img-preview-strip">
                         <img src={previewImg} alt="To analyze" />
-                        <div className="img-preview-label">🔍 Ready to analyze</div>
+                        <div className="img-preview-label">{t ? t.botAnalyze : '🔍 Ready to analyze'}</div>
                         <button className="img-preview-remove" onClick={clearPending} title="Remove image">
                             ✕
                         </button>
@@ -310,7 +341,7 @@ export default function CropChatbot({ open, onClose }) {
                     <textarea
                         ref={textareaRef}
                         className="chat-textarea"
-                        placeholder="Ask about crop diseases, upload a photo, or describe symptoms…"
+                        placeholder={t ? t.botPlaceholder : "Ask about crop diseases, upload a photo, or describe symptoms…"}
                         value={input}
                         onChange={(e) => setInput(e.target.value)}
                         onKeyDown={handleKeyDown}
@@ -332,7 +363,7 @@ export default function CropChatbot({ open, onClose }) {
                         )}
                     </button>
                 </div>
-                <p className="chatbot-hint">📎 Drag &amp; drop images · Enter to send · Shift+Enter new line</p>
+                <p className="chatbot-hint">{t ? t.botHint : '📎 Drag & drop images · Enter to send · Shift+Enter new line'}</p>
             </div>
         </div>
     )
