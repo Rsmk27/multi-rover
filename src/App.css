@@ -760,17 +760,20 @@
 
 .gps-map-placeholder {
   flex: 1;
-  min-height: 0;
+  min-height: 180px;
   border-radius: 16px;
-  background:
-    radial-gradient(circle at 50% 55%, rgba(34, 211, 238, .08), transparent 60%),
-    linear-gradient(180deg, rgba(10, 25, 45, .9), rgba(6, 18, 32, .95));
+  background: #0a192d;
   border: 1px solid rgba(34, 211, 238, .15);
   position: relative;
-  display: flex;
-  align-items: center;
-  justify-content: center;
   overflow: hidden;
+}
+
+.leaflet-container {
+  background: #0a192d !important;
+}
+
+.leaflet-tile {
+  filter: invert(100%) hue-rotate(180deg) brightness(95%) contrast(90%);
 }
 
 .gps-map-link {

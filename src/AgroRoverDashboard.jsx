@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { translations } from './translations'
 import CropChatbot from './CropChatbot'
+import { MapContainer, TileLayer, Marker, useMap } from 'react-leaflet'
+import 'leaflet/dist/leaflet.css'
+import L from 'leaflet'
 import {
   sendCommand,
   setSpeed,
@@ -155,24 +158,51 @@ function ToggleSwitch({ on, onToggle, label, loading = false, t = translations.e
   )
 }
 
+/* ── GPS and Map Helpers ───────────────────────────────────── */
+const roverIcon = new L.DivIcon({
+  className: 'rover-map-marker',
+  html: '<div style="width: 14px; height: 14px; background: #22d3ee; border-radius: 50%; box-shadow: 0 0 10px #22d3ee; border: 2px solid #fff;"></div>',
+  iconSize: [14, 14],
+  iconAnchor: [7, 7]
+})
+
+function MapUpdater({ lat, lng }) {
+  const map = useMap()
+  useEffect(() => {
+    // Smoothly pan to the new location instead of snapping, allowing "explore along with location"
+    map.flyTo([lat, lng], map.getZoom(), {
+      animate: true,
+      duration: 0.5
+    })
+  }, [lat, lng, map])
+  return null
+}
+
 /* ── GPS mini-map placeholder ──────────────────────────────── */
 function GpsCard({ lat, lng, valid, sats, speed, t = translations.en }) {
-  const mapsUrl = valid ? `https://www.google.com/maps?q=${lat},${lng}` : '#'
+  // Use the user's requested location if no valid GPS fix is available yet
+  const displayLat = valid ? lat : 16.509493398943572;
+  const displayLng = valid ? lng : 80.65864952382955;
+
   return (
     <div className="gps-card-inner">
-      <div className="gps-map-placeholder">
-        {valid ? (
-          <a href={mapsUrl} target="_blank" rel="noopener noreferrer" className="gps-map-link">
-            <div className="gps-pin-dot" />
-            <div className="gps-ripple" />
-            <span className="gps-coords">
-              {lat.toFixed(5)}°,{lng.toFixed(5)}°
-            </span>
-          </a>
-        ) : (
-          <div className="gps-no-fix">
-            <IconGps />
-            <span>{t.acquiring}</span>
+      <div className="gps-map-placeholder" style={{ padding: 0, overflow: 'hidden' }}>
+        <MapContainer
+          center={[displayLat, displayLng]}
+          zoom={17}
+          style={{ width: '100%', height: '100%' }}
+          zoomControl={false}
+        >
+          <TileLayer
+            attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+            url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+          />
+          <Marker position={[displayLat, displayLng]} icon={roverIcon} />
+          <MapUpdater lat={displayLat} lng={displayLng} />
+        </MapContainer>
+        {!valid && (
+          <div style={{ position: 'absolute', top: 4, left: 4, background: 'rgba(0,0,0,0.6)', padding: '2px 8px', borderRadius: 4, fontSize: '0.7rem', zIndex: 1000 }}>
+            <span style={{ color: '#fbbf24' }}>●</span> {t.acquiring}
           </div>
         )}
       </div>
@@ -255,7 +285,7 @@ export default function AgroRoverDashboard() {
   const [lastCamUpdate, setLastCamUpdate] = useState(0)
 
   // ── Manual Override ──
-  const [manualIp, setManualIp] = useState('10.177.157.193')
+  const [manualIp, setManualIp] = useState('10.105.197.193')
   const [moistureHistory, setMoistureHistory] = useState([])
 
   const [logs, setLogs] = useState([
@@ -592,13 +622,13 @@ export default function AgroRoverDashboard() {
                 onMouseDown={() => handleCommand('LEFT')} onMouseUp={() => handleCommand('STOP')}
                 onTouchStart={() => handleCommand('LEFT')} onTouchEnd={() => handleCommand('STOP')}
                 disabled={cmdPending || control.returnBase}>
-                <span className="ctrl-text">{t.left}</span><span className="ctrl-arrow">←</span>
+                <span className="ctrl-text">{t.right}</span><span className="ctrl-arrow">→</span>
               </button>
               <button className={`ctrl-btn ${control.command === 'RIGHT' ? 'ctrl-btn--active' : ''}`}
                 onMouseDown={() => handleCommand('RIGHT')} onMouseUp={() => handleCommand('STOP')}
                 onTouchStart={() => handleCommand('RIGHT')} onTouchEnd={() => handleCommand('STOP')}
                 disabled={cmdPending || control.returnBase}>
-                <span className="ctrl-text">{t.right}</span><span className="ctrl-arrow">→</span>
+                <span className="ctrl-text">{t.left}</span><span className="ctrl-arrow">←</span>
               </button>
               <button className={`ctrl-btn ${control.command === 'BACKWARD' ? 'ctrl-btn--active' : ''}`}
                 onMouseDown={() => handleCommand('BACKWARD')} onMouseUp={() => handleCommand('STOP')}

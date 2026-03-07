@@ -31,7 +31,7 @@ function fileToBase64(file) {
     })
 }
 
-async function callGroq(messages, imageDataUrl = null, imageMime = null) {
+async function callGroq(messages, imageDataUrl = null, imageMime = null, lang = 'en') {
     if (!GROQ_API_KEY) throw new Error('No API key set. Add VITE_GROQ_API_KEY to your .env file.')
 
     let chatMessages
@@ -192,7 +192,7 @@ export default function CropChatbot({ open, onClose, lang = 'en', t }) {
         setLoading(true)
 
         try {
-            const reply = await callGroq(newMessages, img?.dataUrl, img?.mime)
+            const reply = await callGroq(newMessages, img?.dataUrl, img?.mime, lang)
             setMessages((prev) => [
                 ...prev,
                 {
