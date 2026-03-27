@@ -12,6 +12,8 @@ A web-controlled agricultural rover built with dual ESP32 microcontrollers. It f
 
 ## Hardware & Wiring
 
+![Circuit Diagram](./agri%20rover.png)
+
 ### 1. Main ESP32 (Control & Sensors)
 This ESP32 handles motors, pump, moisture sensor, GPS, and servos.
 
