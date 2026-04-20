@@ -121,3 +121,6 @@ Open the provided local URL (typically `http://localhost:5173`) in your browser.
 - **Return to Base:** Click the Home icon to autonomously command the rover to head back to its designated base target.
 - **Camera Feed:** The stream will auto-populate if the ESP32-CAM is online and connected to Firebase. You can also manually type the IP address if your local firewall blocks the Firebase update.
 - **AgriAI Chatbot:** Click the floating `🌿 AgriAI` button to chat with the Llama-3-powered agricultural assistant about crop advice, maintenance, etc.
+
+
+developed by @Rsmk27 and @jagadeesh
